@@ -1,0 +1,17 @@
+services:
+  brigade:
+    build: .
+    container_name: brigade
+    restart: unless-stopped
+    ports:
+      # Exposé uniquement sur la boucle locale de la machine hôte.
+      - "127.0.0.1:3100:3100"
+    volumes:
+      - brigade-data:/data
+    environment:
+      # Optionnel : si défini, le MCP exige "Authorization: Bearer <jeton>".
+      BRIGADE_TOKEN: ${BRIGADE_TOKEN:-}
+      BRIGADE_PUBLIC_URL: ${BRIGADE_PUBLIC_URL:-http://localhost:3100}
+
+volumes:
+  brigade-data:

@@ -1,0 +1,28 @@
+{
+  "name": "brigade",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Gestionnaire de projet local pour agents IA, expos\u00e9 via MCP.",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/server.js",
+    "typecheck": "tsc --noEmit",
+    "smoke": "tsx test/smoke.ts",
+    "build:web": "npm --prefix web run build",
+    "build:all": "npm run build && npm run build:web",
+    "install:all": "npm ci && npm --prefix web ci"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.6",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "hono": "^4.13.16",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}

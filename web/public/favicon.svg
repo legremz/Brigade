@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Brigade">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#232733"/>
+      <stop offset="1" stop-color="#12141a"/>
+    </linearGradient>
+    <linearGradient id="hat" gradientUnits="userSpaceOnUse" x1="0" y1="108" x2="0" y2="344">
+      <stop offset="0" stop-color="#ff9a5f"/>
+      <stop offset="1" stop-color="#ff6a2b"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#bg)" stroke="#2d3240" stroke-width="4"/>
+  <!-- toque : trois bouffants + corps -->
+  <g fill="url(#hat)">
+    <circle cx="171" cy="226" r="68"/>
+    <circle cx="256" cy="190" r="82"/>
+    <circle cx="341" cy="226" r="68"/>
+    <rect x="148" y="226" width="216" height="118"/>
+  </g>
+  <!-- bandeau -->
+  <rect x="148" y="356" width="216" height="56" rx="14" fill="#ff7a3d"/>
+  <rect x="148" y="356" width="216" height="56" rx="14" fill="none" stroke="#12141a" stroke-opacity=".25" stroke-width="3"/>
+  <!-- cartes kanban sur le bandeau -->
+  <g fill="#12141a" fill-opacity=".55">
+    <rect x="172" y="376" width="48" height="16" rx="5"/>
+    <rect x="232" y="376" width="48" height="16" rx="5"/>
+    <rect x="292" y="376" width="48" height="16" rx="5"/>
+  </g>
+  <!-- coche : tâche terminée -->
+  <path d="M208 268 l36 36 l66 -76" fill="none" stroke="#12141a" stroke-width="22" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
