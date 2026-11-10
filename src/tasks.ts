@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { db } from "./db.js";
+import { humanDuration, lastActivity, minutesSince, parseStaleMinutes } from "./stale.js";
 import { InvalidError, NotFoundError, getProject, type Project } from "./store.js";
 
 const now = () => new Date().toISOString();
@@ -12,6 +13,12 @@ export const DIFFICULTIES = ["easy", "medium", "hard"] as const;
 export type Status = (typeof STATUSES)[number];
 export type Priority = (typeof PRIORITIES)[number];
 export type Difficulty = (typeof DIFFICULTIES)[number];
+
+/** Lu au chargement du module : une valeur invalide empêche le serveur de démarrer. */
+const STALE_MINUTES = parseStaleMinutes(process.env.BRIGADE_STALE_MINUTES);
+
+/** Déplacement refusé, mais qu'un humain peut imposer après confirmation explicite. */
+export class ForceRequiredError extends InvalidError {}
 
 // ================= Agents =================
 
@@ -135,20 +142,39 @@ export interface Task {
   review_required: boolean | null;
   review_effective: boolean;
   result: string;
+  /** Commande ou contrôle réalisé pour prouver le résultat. */
+  verification: string;
   review_notes: string;
+  /** Renseigné si un humain a imposé le passage en « terminée » malgré dépendances ou relecture. */
+  forced_note: string;
   depends_on: TaskRef[];
   /** Dépendances pas encore terminées (et relues si la relecture est exigée). */
   blocked_by: TaskRef[];
   /** À faire et toutes les dépendances sont satisfaites : peut être démarrée. */
   ready: boolean;
   question_ids: string[];
+  /** Tâche à faire par l'humain : exclue des actions suggérées aux agents. Toujours posé explicitement. */
+  for_human: boolean;
   created_at: string;
   updated_at: string;
   started_at: string | null;
   completed_at: string | null;
+  /** Le plus récent de `updated_at` et `started_at`. */
+  last_activity_at: string;
+  /** En cours sans activité depuis le seuil : à signaler, jamais libérée automatiquement. */
+  stale: boolean;
+  /** Durée lisible depuis la dernière activité (« 3 h »), renseignée seulement si `stale`. */
+  stale_for: string | null;
 }
 
 const REF_SQL = "SELECT t.id, t.seq, t.title, t.status FROM tasks t JOIN task_deps d ON d.depends_on_id = t.id WHERE d.task_id = ? ORDER BY t.seq";
+
+function activityOf(status: Status, updatedAt: string, startedAt: string | null): Pick<Task, "last_activity_at" | "stale" | "stale_for"> {
+  const last_activity_at = lastActivity(updatedAt, startedAt);
+  const idle = minutesSince(last_activity_at);
+  const stale = status === "in_progress" && idle >= STALE_MINUTES;
+  return { last_activity_at, stale, stale_for: stale ? humanDuration(idle) : null };
+}
 
 function toTask(row: Row, project: Project): Task {
   const id = String(row.id);
@@ -158,6 +184,7 @@ function toTask(row: Row, project: Project): Task {
     aid ? (db.prepare("SELECT id, name FROM agents WHERE id = ?").get(String(aid)) as Task["assignee"]) ?? null : null;
   const override = row.review_required == null ? null : Boolean(row.review_required);
   const status = String(row.status) as Status;
+  const startedAt = row.started_at ? String(row.started_at) : null;
   return {
     id,
     project_id: String(row.project_id),
@@ -172,17 +199,21 @@ function toTask(row: Row, project: Project): Task {
     review_required: override,
     review_effective: override ?? project.review_required,
     result: String(row.result),
+    verification: String(row.verification),
     review_notes: String(row.review_notes),
+    forced_note: String(row.forced_note),
     depends_on,
     blocked_by,
     ready: status === "todo" && blocked_by.length === 0,
     question_ids: (db.prepare("SELECT question_id FROM task_questions WHERE task_id = ?").all(id) as Row[]).map((r) =>
       String(r.question_id),
     ),
+    for_human: Boolean(row.for_human),
     created_at: String(row.created_at),
     updated_at: String(row.updated_at),
-    started_at: row.started_at ? String(row.started_at) : null,
+    started_at: startedAt,
     completed_at: row.completed_at ? String(row.completed_at) : null,
+    ...activityOf(status, String(row.updated_at), startedAt),
   };
 }
 
@@ -238,7 +269,7 @@ function addDependency(taskId: string, dependsOnId: string): void {
 }
 
 /** Résout une référence de tâche : id existant, ou « #n » (numéro dans le projet). */
-function resolveTaskRef(projectId: string, ref: string): string {
+export function resolveTaskRef(projectId: string, ref: string): string {
   const seq = /^#?(\d+)$/.exec(ref.trim());
   const row = (
     seq
@@ -276,6 +307,7 @@ export interface NewTask {
   /** `ref` d'une tâche du même lot, id de tâche existante, ou « #n ». */
   depends_on?: string[];
   question_ids?: string[];
+  for_human?: boolean;
 }
 
 export function createTasks(projectRef: string, inputs: NewTask[]): Task[] {
@@ -288,7 +320,7 @@ export function createTasks(projectRef: string, inputs: NewTask[]): Task[] {
     let seq = (db.prepare("SELECT COALESCE(MAX(seq), 0) AS m FROM tasks WHERE project_id = ?").get(project.id) as Row).m as number;
     const ins = db.prepare(
       `INSERT INTO tasks (id, project_id, seq, title, description, priority, difficulty, assignee_id, reviewer_id,
-         review_required, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+         review_required, for_human, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     );
     for (const t of inputs) {
       if (!t.title.trim()) throw new InvalidError("Une tâche a un titre vide.");
@@ -306,6 +338,7 @@ export function createTasks(projectRef: string, inputs: NewTask[]): Task[] {
         t.assignee ? resolveAgent(project.id, t.assignee).id : null,
         t.reviewer ? resolveAgent(project.id, t.reviewer).id : null,
         t.review == null ? null : t.review ? 1 : 0,
+        t.for_human ? 1 : 0,
         ts,
         ts,
       );
@@ -339,10 +372,36 @@ export interface TaskPatch {
   reviewer?: string | null;
   /** true/false = surcharge ; null = hérite du projet. */
   review?: boolean | null;
+  for_human?: boolean;
   add_depends_on?: string[];
   remove_depends_on?: string[];
   link_questions?: string[];
   unlink_questions?: string[];
+}
+
+type ColumnValue = string | number | null;
+
+/** Colonnes à écrire pour un patch : seuls les champs présents, la résolution d'un agent inconnu annule la transaction. */
+function patchColumns(patch: TaskPatch, projectId: string): [string, ColumnValue][] {
+  const columns: [string, ColumnValue][] = [];
+  const add = <T>(column: string, value: T | undefined, encode: (v: T) => ColumnValue) => {
+    if (value !== undefined) columns.push([column, encode(value)]);
+  };
+  const asIs = (v: string) => v;
+  const agentId = (ref: string | null) => (ref ? resolveAgent(projectId, ref).id : null);
+  const title = (v: string) => {
+    if (!v.trim()) throw new InvalidError("Le titre est vide.");
+    return v.trim();
+  };
+  add("title", patch.title, title);
+  add("description", patch.description, asIs);
+  add("priority", patch.priority, asIs);
+  add("difficulty", patch.difficulty, asIs);
+  add("assignee_id", patch.assignee, agentId);
+  add("reviewer_id", patch.reviewer, agentId);
+  add("review_required", patch.review, (v: boolean | null) => (v === null ? null : Number(v)));
+  add("for_human", patch.for_human, Number);
+  return columns;
 }
 
 export function updateTask(id: string, patch: TaskPatch): Task {
@@ -350,24 +409,9 @@ export function updateTask(id: string, patch: TaskPatch): Task {
   const projectId = String(row.project_id);
   db.exec("BEGIN");
   try {
-    const sets: string[] = [];
-    const args: (string | number | null)[] = [];
-    const set = (col: string, v: string | number | null) => {
-      sets.push(`${col} = ?`);
-      args.push(v);
-    };
-    if (patch.title !== undefined) {
-      if (!patch.title.trim()) throw new InvalidError("Le titre est vide.");
-      set("title", patch.title.trim());
-    }
-    if (patch.description !== undefined) set("description", patch.description);
-    if (patch.priority) set("priority", patch.priority);
-    if (patch.difficulty) set("difficulty", patch.difficulty);
-    if (patch.assignee !== undefined) set("assignee_id", patch.assignee ? resolveAgent(projectId, patch.assignee).id : null);
-    if (patch.reviewer !== undefined) set("reviewer_id", patch.reviewer ? resolveAgent(projectId, patch.reviewer).id : null);
-    if (patch.review !== undefined) set("review_required", patch.review === null ? null : patch.review ? 1 : 0);
-    set("updated_at", now());
-    db.prepare(`UPDATE tasks SET ${sets.join(", ")} WHERE id = ?`).run(...args, id);
+    const columns = patchColumns(patch, projectId);
+    columns.push(["updated_at", now()]);
+    db.prepare(`UPDATE tasks SET ${columns.map(([column]) => `${column} = ?`).join(", ")} WHERE id = ?`).run(...columns.map(([, value]) => value), id);
 
     for (const dep of patch.add_depends_on ?? []) addDependency(id, resolveTaskRef(projectId, dep));
     for (const dep of patch.remove_depends_on ?? [])
@@ -401,6 +445,16 @@ function expectStatus(t: Task, ...allowed: Status[]): void {
     );
 }
 
+const openDependencies = (t: Task): string =>
+  `dépendance(s) non terminée(s) : ${t.blocked_by.map((d) => `#${d.seq}`).join(", ")}`;
+
+/** Trace d'une fin atteinte alors qu'une dépendance est ouverte ; vide sinon. */
+const openDependencyNote = (t: Task): string =>
+  t.blocked_by.length ? `Fin déclarée le ${now()} malgré : ${openDependencies(t)}.` : "";
+
+/** Une note de forçage ne disparaît qu'au retour à « à faire » : la relecture d'une fin imposée la conserve. */
+const keptForcedNote = (t: Task, status: Status): string => (status === "todo" ? "" : t.forced_note);
+
 /** Démarrage atomique : refuse si une dépendance n'est pas terminée (et relue si exigé). */
 export function startTask(id: string, agentRef?: string): Task {
   db.exec("BEGIN IMMEDIATE");
@@ -423,21 +477,34 @@ export function startTask(id: string, agentRef?: string): Task {
 }
 
 /** Fin du travail : passe en relecture si exigée, sinon terminée. */
-export function completeTask(id: string, result: string): Task {
+export function completeTask(id: string, result: string, verification: string): Task {
   const t = getTask(id);
   expectStatus(t, "in_progress");
+  if (!result.trim()) throw new InvalidError("Le résultat est vide : décris ce qui a été fait.");
+  if (!verification.trim()) throw new InvalidError("La vérification est vide : indique la commande ou le contrôle réalisé.");
   const next: Status = t.review_effective ? "review" : "done";
-  touch(id, "status = ?, result = ?, completed_at = ?, review_notes = ''", next, result, next === "done" ? now() : null);
+  // Possible après un déplacement manuel en « En cours » : pas de refus, mais la fin ne doit pas passer inaperçue.
+  const forcedNote = openDependencyNote(t);
+  touch(
+    id,
+    "status = ?, result = ?, verification = ?, completed_at = ?, review_notes = '', forced_note = ?",
+    next,
+    result.trim(),
+    verification.trim(),
+    next === "done" ? now() : null,
+    forcedNote,
+  );
   return getTask(id);
 }
 
 export function reviewTask(id: string, verdict: "approve" | "changes", notes: string): Task {
   const t = getTask(id);
   expectStatus(t, "review");
-  if (verdict === "approve") touch(id, "status = 'done', review_notes = ?, completed_at = ?", notes, now());
+  if (verdict === "approve")
+    touch(id, "status = 'done', review_notes = ?, completed_at = ?, forced_note = ?", notes, now(), t.forced_note || openDependencyNote(t));
   else {
     if (!notes.trim()) throw new InvalidError("Précise ce qu'il faut corriger (notes) pour demander des changements.");
-    touch(id, "status = 'todo', review_notes = ?, completed_at = NULL", notes);
+    touch(id, "status = 'todo', review_notes = ?, completed_at = NULL, forced_note = ''", notes);
   }
   return getTask(id);
 }
@@ -446,20 +513,37 @@ export function reviewTask(id: string, verdict: "approve" | "changes", notes: st
 export function releaseTask(id: string): Task {
   const t = getTask(id);
   expectStatus(t, "in_progress", "review");
-  touch(id, "status = 'todo', started_at = NULL, completed_at = NULL");
+  touch(id, "status = 'todo', started_at = NULL, completed_at = NULL, forced_note = ''");
   return getTask(id);
 }
 
-/** Déplacement manuel depuis l'interface (l'humain a le dernier mot) : n'applique pas les dépendances. */
-export function forceStatus(id: string, status: Status): Task {
-  getTask(id);
+function doneBlockers(t: Task): string[] {
+  const blockers: string[] = [];
+  if (t.blocked_by.length) blockers.push(openDependencies(t));
+  if (t.review_effective) blockers.push("relecture non approuvée");
+  return blockers;
+}
+
+/**
+ * Déplacement manuel depuis l'interface. Le passage en « terminée » respecte dépendances et relecture :
+ * l'humain garde le dernier mot, mais seulement par un `force` explicite, tracé sur la tâche.
+ */
+export function forceStatus(id: string, status: Status, opts: { force?: boolean } = {}): Task {
+  const t = getTask(id);
+  if (t.status === status) return t;
+  const blockers = status === "done" ? doneBlockers(t) : [];
+  if (blockers.length && !opts.force)
+    throw new ForceRequiredError(`La tâche #${t.seq} ne peut pas passer en « Terminées » : ${blockers.join(" ; ")}.`);
+  const ts = now();
+  const forcedNote = blockers.length ? `Terminée manuellement le ${ts} malgré : ${blockers.join(" ; ")}.` : keptForcedNote(t, status);
   touch(
     id,
-    "status = ?, started_at = CASE WHEN ? = 'todo' THEN NULL ELSE COALESCE(started_at, ?) END, completed_at = ?",
+    "status = ?, started_at = CASE WHEN ? = 'todo' THEN NULL ELSE COALESCE(started_at, ?) END, completed_at = ?, forced_note = ?",
     status,
     status,
-    now(),
-    status === "done" ? now() : null,
+    ts,
+    status === "done" ? ts : null,
+    forcedNote,
   );
   return getTask(id);
 }

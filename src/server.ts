@@ -3,6 +3,7 @@ import { serveStatic } from "@hono/node-server/serve-static";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { Hono } from "hono";
 import { api } from "./api.js";
+import { localOnly } from "./guard.js";
 import { createMcpServer } from "./mcp.js";
 
 const PORT = Number(process.env.PORT ?? 3100);
@@ -14,8 +15,13 @@ const app = new Hono();
 
 app.get("/health", (c) => c.json({ ok: true }));
 
+// Appliqué avant les routes ; /health reste libre pour le healthcheck Docker.
+const guard = localOnly();
+app.use("/api/*", guard);
+app.use("/mcp", guard);
+
 // Auth par jeton (Bearer) sur le MCP, uniquement si BRIGADE_TOKEN est défini.
-// L'interface web et son API ne sont pas protégées : l'exposition se limite à la boucle locale.
+// L'interface web et son API restent sans jeton : elles sont protégées par localOnly.
 app.use("/mcp", async (c, next) => {
   if (TOKEN && c.req.header("authorization") !== `Bearer ${TOKEN}`) {
     return c.json({ error: "unauthorized" }, 401);

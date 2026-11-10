@@ -1,33 +1,27 @@
-import { useEffect, useState } from "react";
-import { api, type Grill, type GrillSummary, type Project, type Question } from "./api";
-import { Markdown } from "./Markdown";
+import { useState } from "react";
+import { api, type GrillSummary, type Project } from "./api";
 import { AgentsPage } from "./AgentsPage";
 import { SkillsPage } from "./SkillsPage";
 import { Board } from "./Board";
-import { Crumbs, ErrorBox } from "./common";
+import { Crumbs, ErrorBox, Progress } from "./common";
+import { DecisionsPage } from "./DecisionsPage";
+import { countsByProject, ForYou } from "./ForYou";
+import { GrillPage } from "./GrillPage";
 import { ProjectTabs } from "./ProjectTabs";
-import { QuestionCard } from "./QuestionCard";
 import { useLoad } from "./hooks";
 import { href, useRoute } from "./router";
 
 const date = (iso: string) =>
   new Date(iso).toLocaleString("fr-FR", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
 
-function Progress({ answered, total }: { answered: number; total: number }) {
-  return (
-    <span className="progress" title={`${answered} répondue(s) sur ${total}`}>
-      <span className="bar">
-        <span style={{ width: total ? `${(answered / total) * 100}%` : 0 }} />
-      </span>
-      {answered}/{total}
-    </span>
-  );
-}
-
 // ---------- Accueil ----------
 
+const POLL_MS = 5000;
+
 function Home() {
-  const { data, error, reload } = useLoad(() => api.projects(), [], 5000);
+  const { data, error, reload } = useLoad(() => api.projects(), [], POLL_MS);
+  const queue = useLoad(() => api.queue(), [], POLL_MS);
+  const pending = countsByProject(queue.data);
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [formError, setFormError] = useState<string | null>(null);
@@ -47,7 +41,8 @@ function Home() {
 
   return (
     <>
-      <h1>Projets</h1>
+      <ForYou queue={queue.data} error={queue.error} />
+      <h1 className="section-title">Projets</h1>
       {error && <ErrorBox message={error} />}
       {data?.length === 0 && <p className="muted">Aucun projet pour l'instant. Crée-en un ci-dessous, ou demande à Claude de le faire.</p>}
       <div className="grid">
@@ -55,13 +50,9 @@ function Home() {
           <a key={p.id} className="card project" href={href.project(p.slug)}>
             <h2>{p.name}</h2>
             {p.description && <p className="muted">{p.description}</p>}
-            <p>
-              {p.pending_questions ? (
-                <span className="pill pending">{p.pending_questions} question(s) à répondre</span>
-              ) : (
-                <span className="pill answered">À jour</span>
-              )}
-            </p>
+            {pending.has(p.id) && (
+              <p><span className="pill pending">{pending.get(p.id)} à traiter</span></p>
+            )}
           </a>
         ))}
       </div>
@@ -122,103 +113,6 @@ function ProjectPage({ slug }: { slug: string }) {
   );
 }
 
-// ---------- Grill ----------
-
-function GrillPage({ slug, id }: { slug: string; id: string }) {
-  const { data: grill, setData, error } = useLoad(() => api.grill(id), [id]);
-
-  function updateQuestion(q: Question) {
-    setData((g: Grill | null) => {
-      if (!g) return g;
-      const questions = g.questions.map((x) => (x.id === q.id ? q : x));
-      return { ...g, questions, answered: questions.filter((x) => x.answered).length };
-    });
-  }
-
-  // Colonne affichée par question. Une carte en cours d'édition garde sa place,
-  // elle ne bascule qu'après la perte du focus.
-  const [placed, setPlaced] = useState<Record<string, "todo" | "done">>({});
-  const [active, setActive] = useState<string | null>(null);
-  useEffect(() => {
-    if (!grill) return;
-    setPlaced((prev) => {
-      const next = { ...prev };
-      for (const q of grill.questions) if (q.id !== active || !(q.id in next)) next[q.id] = q.answered ? "done" : "todo";
-      return next;
-    });
-  }, [grill, active]);
-
-  async function setStatus(status: "open" | "submitted") {
-    setData(await api.setStatus(id, status));
-  }
-
-  async function remove() {
-    if (!confirm("Supprimer ce grill et ses réponses ?")) return;
-    await api.deleteGrill(id);
-    location.hash = href.project(slug);
-  }
-
-  if (error) return <ErrorBox message={error} />;
-  if (!grill) return <p className="muted">Chargement…</p>;
-
-  const remaining = grill.total - grill.answered;
-  return (
-    <>
-      <Crumbs items={[{ label: grill.project.name, to: href.project(slug) }, { label: grill.title }]} />
-      <div className="grill-head">
-        <h1>{grill.title}</h1>
-        <Progress answered={grill.answered} total={grill.total} />
-      </div>
-      {grill.context && (
-        <section className="card context">
-          <Markdown>{grill.context}</Markdown>
-        </section>
-      )}
-      <div className="columns">
-        {(["todo", "done"] as const).map((col) => {
-          const items = grill.questions.filter((q) => (placed[q.id] ?? (q.answered ? "done" : "todo")) === col);
-          return (
-            <section key={col} className={`column ${col}`}>
-              <h2 className="col-title">
-                {col === "todo" ? "À répondre" : "Répondues"} <span className="count">{items.length}</span>
-              </h2>
-              {items.length === 0 && (
-                <p className="muted empty">{col === "todo" ? "Tout est traité 🎉" : "Rien pour l'instant."}</p>
-              )}
-              {items.map((q) => (
-                <QuestionCard
-                  key={q.id}
-                  question={q}
-                  onUpdate={updateQuestion}
-                  onActive={(a) => setActive((cur) => (a ? q.id : cur === q.id ? null : cur))}
-                />
-              ))}
-            </section>
-          );
-        })}
-      </div>
-      <section className="card finish">
-        {grill.status === "submitted" ? (
-          <>
-            <p>✔ Marqué terminé. Dis à Claude de consulter tes réponses.</p>
-            <button type="button" className="ghost" onClick={() => void setStatus("open")}>Rouvrir</button>
-          </>
-        ) : (
-          <>
-            <p>
-              {remaining === 0
-                ? "Tout est répondu. Tu peux dire à Claude de consulter tes réponses."
-                : `${remaining} question(s) sans réponse. Les questions non traitées seront signalées à Claude.`}
-            </p>
-            <button type="button" className="primary" onClick={() => void setStatus("submitted")}>J'ai fini</button>
-          </>
-        )}
-        <button type="button" className="danger" onClick={() => void remove()}>Supprimer le grill</button>
-      </section>
-    </>
-  );
-}
-
 export function App() {
   const route = useRoute();
   return (
@@ -228,7 +122,8 @@ export function App() {
       {route.page === "board" && <Board key={route.slug} slug={route.slug} openId={route.task} />}
       {route.page === "skills" && <SkillsPage key={route.slug} slug={route.slug} />}
       {route.page === "agents" && <AgentsPage key={route.slug} slug={route.slug} />}
-      {route.page === "grill" && <GrillPage key={route.id} slug={route.slug} id={route.id} />}
+      {route.page === "decisions" && <DecisionsPage key={route.slug} slug={route.slug} />}
+      {route.page === "grill" && <GrillPage key={route.id} slug={route.slug} id={route.id} targetQuestion={route.question} />}
     </main>
   );
 }

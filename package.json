@@ -1,6 +1,6 @@
 {
   "name": "brigade",
-  "version": "0.2.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "description": "Gestionnaire de projet local pour agents IA, expos\u00e9 via MCP.",

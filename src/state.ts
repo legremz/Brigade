@@ -1,6 +1,14 @@
 import { getProject, listGrills, type GrillSummary, type Project } from "./store.js";
 import { listSkills } from "./skills.js";
+import { listDecisions, listAwaitingDecisions, type AwaitingDecision, type Decision } from "./decisions.js";
 import { listAgents, listTasks, type AgentStatus, type Task } from "./tasks.js";
+
+export interface DecisionsOverview {
+  total: number;
+  awaiting: AwaitingDecision[];
+  /** Les plus récentes d'abord. */
+  recent: Decision[];
+}
 
 export interface ProjectState {
   project: Project;
@@ -16,17 +24,29 @@ export interface ProjectState {
     done: number;
     total: number;
   };
+  decisions: DecisionsOverview;
   agents: AgentStatus[];
   skills: ReturnType<typeof listSkills>;
   next_actions: string[];
 }
 
-const minutesSince = (iso: string | null) => (iso ? Math.round((Date.now() - new Date(iso).getTime()) / 60000) : 0);
-export const humanDuration = (min: number) =>
-  min < 60 ? `${min} min` : min < 2880 ? `${Math.round(min / 60)} h` : `${Math.round(min / 1440)} j`;
+const RECENT_DECISIONS = 5;
 
-/** Un travail « en cours » depuis longtemps a peut-être été abandonné (agent planté). */
-const STALE_MINUTES = 120;
+function decisionsOverview(ref: string): DecisionsOverview {
+  const all = listDecisions(ref);
+  return { total: all.length, awaiting: listAwaitingDecisions(ref), recent: all.slice(0, RECENT_DECISIONS) };
+}
+
+function decisionActions({ total, awaiting }: DecisionsOverview): string[] {
+  const actions: string[] = [];
+  if (awaiting.length)
+    actions.push(
+      `${awaiting.length} « Décide pour moi » encore sans décision (${awaiting.map((q) => `« ${q.grill_title} » question ${q.position} : ${q.id}`).join(", ")}) : ` +
+        "tranche puis enregistre avec record_decision (question_id).",
+    );
+  if (total) actions.push(`${total} décision(s) enregistrée(s) : list_decisions pour les relire ; get_task transmet celles de chaque tâche.`);
+  return actions;
+}
 
 export function projectState(ref: string): ProjectState {
   const project = getProject(ref);
@@ -41,6 +61,7 @@ export function projectState(ref: string): ProjectState {
   const review = all.filter((t) => t.status === "review");
   const done = all.filter((t) => t.status === "done").length;
   const awaiting = grills.filter((g) => g.status === "open" && g.answered < g.total);
+  const decisions = decisionsOverview(ref);
 
   const next: string[] = [];
   const always = skills.filter((x) => x.always);
@@ -57,17 +78,20 @@ export function projectState(ref: string): ProjectState {
   const answeredGrills = grills.filter((g) => g.answered > 0 && !awaiting.includes(g));
   if (answeredGrills.length && all.length === 0)
     next.push(`Des grills sont répondus (${answeredGrills.map((g) => g.id).join(", ")}) mais aucune tâche n'existe : lis get_answers puis découpe le travail avec create_tasks.`);
-  for (const t of review)
+  next.push(...decisionActions(decisions));
+  // Tâches humaines : visibles dans le kanban, jamais proposées aux agents.
+  const forAgents = (t: Task) => !t.for_human;
+  for (const t of review.filter(forAgents))
     next.push(`Relire #${t.seq} « ${t.title} »${t.reviewer ? ` (relecteur prévu : ${t.reviewer.name})` : ""} avec review_task.`);
-  for (const t of in_progress) {
-    const min = minutesSince(t.started_at);
-    if (min >= STALE_MINUTES)
-      next.push(`#${t.seq} « ${t.title} » est en cours depuis ${humanDuration(min)} : vérifie qu'un agent y travaille encore, sinon release_task.`);
-  }
-  if (ready.length) {
+  for (const t of in_progress.filter((x) => x.stale && forAgents(x)))
+    next.push(`#${t.seq} « ${t.title} » est sans activité depuis ${t.stale_for} : vérifie qu'un agent y travaille encore, sinon release_task.`);
+  const humanReady = ready.filter((t) => t.for_human);
+  if (humanReady.length) next.push(`Réservées à l'humain, ne les fais pas à sa place : ${humanReady.map((t) => `#${t.seq}`).join(", ")}.`);
+  const agentReady = ready.filter(forAgents);
+  if (agentReady.length) {
     const free = agents.filter((a) => a.available).map((a) => a.name);
     next.push(
-      `Démarrables maintenant : ${ready.map((t) => `#${t.seq}`).join(", ")} (par priorité). ` +
+      `Démarrables maintenant : ${agentReady.map((t) => `#${t.seq}`).join(", ")} (par priorité). ` +
         (project.mode === "team"
           ? `Agents disponibles : ${free.length ? free.join(", ") : "aucun"} ; assigne les tâches non assignées avec update_task.`
           : "Mode « chat courant » : fais-les toi-même, ou délègue à un sous-agent générique."),
@@ -82,6 +106,7 @@ export function projectState(ref: string): ProjectState {
     grills,
     awaiting_answers: awaiting,
     tasks: { todo: ready.length + blocked.length, ready, blocked, in_progress, review, done, total: all.length },
+    decisions,
     agents,
     skills,
     next_actions: next,

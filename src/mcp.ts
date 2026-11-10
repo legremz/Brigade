@@ -2,9 +2,11 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import * as store from "./store.js";
-import { humanDuration, projectState } from "./state.js";
+import { humanDuration } from "./stale.js";
+import { projectState } from "./state.js";
 import * as skills from "./skills.js";
 import * as tasks from "./tasks.js";
+import * as decisions from "./decisions.js";
 
 const startedAt = new Date();
 const PUBLIC_URL = (process.env.BRIGADE_PUBLIC_URL ?? "http://localhost:3100").replace(/\/$/, "");
@@ -31,14 +33,39 @@ function safe<A>(fn: (args: A) => CallToolResult | Promise<CallToolResult>) {
   };
 }
 
+/** Sens exact de chaque sortie pour l'agent qui lit les réponses. */
+const OUTCOME_GUIDANCE: Record<store.Outcome, (q: store.Question) => string> = {
+  accept_default: (q) => `**Sortie : proposition validée.** Consigne : la proposition fait foi : « ${q.default_answer} ».`,
+  decide_for_me: () => "**Sortie : décide pour moi.** Consigne : tranche toi-même et écris ta décision.",
+  not_relevant: () => "**Sortie : pas pertinent.** Consigne : écarte cette question.",
+  later: () => "**Sortie : plus tard.** Consigne : laisse la question ouverte, ne présume rien.",
+};
+
+function outcomeLine(q: store.Question, outcome: store.Outcome): string {
+  if (outcome === "decide_for_me" && !q.awaiting_decision) return "**Sortie : décide pour moi.** Décision enregistrée.";
+  return OUTCOME_GUIDANCE[outcome](q);
+}
+
+function answerLines(q: store.Question): string[] {
+  const written = q.answer_text.trim();
+  if (q.outcome) return [outcomeLine(q, q.outcome), ...(written ? [`Note de l'utilisateur :\n${written}`] : [])];
+  if (q.skipped) return ["**Réponse : question passée (ancienne valeur, intention d'origine inconnue).**"];
+  if (written) return [`**Réponse :**\n${written}`];
+  return q.attachments.length === 0 ? ["**Réponse : (pas encore répondu)**"] : [];
+}
+
 /** Rend une question (et sa réponse) en markdown + blocs image. */
 function renderQuestion(q: store.Question, content: CallToolResult["content"]): void {
   const lines = [`### ${q.position}. ${q.text}  \`${q.id}\``];
+  if (q.critical) lines.push("**Question critique.**");
   if (q.hint) lines.push(`_Indication : ${q.hint}_`);
   if (q.choices) lines.push(`Suggestions : ${q.choices.join(" · ")}`);
-  if (q.skipped) lines.push("**Réponse : question passée (pas de réponse voulue).**");
-  else if (q.answer_text.trim()) lines.push(`**Réponse :**\n${q.answer_text.trim()}`);
-  else if (q.attachments.length === 0) lines.push("**Réponse : (pas encore répondu)**");
+  if (q.default_answer) lines.push(`Proposition de l'agent : ${q.default_answer}`);
+  if (q.modified_since_read) lines.push("⚠ **Modifiée depuis ta dernière lecture.**");
+  lines.push(...answerLines(q));
+  if (q.awaiting_decision) lines.push(`⚠ **Attend une décision : tranche, puis record_decision (question_id : ${q.id}).**`);
+  const recorded = decisions.decisionsForQuestion(q.id);
+  if (recorded.length) lines.push("Décision(s) enregistrée(s) :", ...recorded.map(decisionLine));
   content.push({ type: "text", text: lines.join("\n") });
   for (const a of q.attachments) {
     if (a.size > MAX_INLINE_IMAGE_BYTES) {
@@ -54,16 +81,60 @@ function renderQuestion(q: store.Question, content: CallToolResult["content"]): 
   }
 }
 
+const EXCERPT_CHARS = 120;
+const excerpt = (t: string | null) => (t ?? "").trim().split("\n")[0]!.slice(0, EXCERPT_CHARS);
+
+function decisionSource(d: decisions.Decision): string {
+  switch (d.source) {
+    case "linked":
+      return `question \`${d.question?.id}\` (« ${excerpt(d.question_text)} »)`;
+    case "deleted":
+      return `source supprimée (« ${excerpt(d.question_text)} »)`;
+    case "none":
+      return "jamais de source";
+    default: {
+      const unknown: never = d.source;
+      throw new Error(`Source de décision inconnue : ${String(unknown)}`);
+    }
+  }
+}
+
+const decisionLine = (d: decisions.Decision): string => {
+  const source = ` — ${decisionSource(d)}`;
+  const linked = d.tasks.length ? ` — tâches ${d.tasks.map((t) => `#${t.seq}`).join(", ")}` : "";
+  return `- \`${d.id}\` (${d.created_at}) : ${d.decision} — raison : ${d.reason}${source}${linked}`;
+};
+
 const taskLine = (t: tasks.Task) => {
   const state = t.status === "todo" ? (t.ready ? "todo · PRÊTE" : `todo · BLOQUÉE par ${t.blocked_by.map((d) => "#" + d.seq).join(",")}`) : t.status;
   return (
-    `- #${t.seq} [${state}] (${t.priority}, ${t.difficulty}) ${t.title}` +
+    `- #${t.seq} [${state}]${t.for_human ? " [POUR L'HUMAIN]" : ""} (${t.priority}, ${t.difficulty}) ${t.title}` +
     (t.assignee ? ` — agent : ${t.assignee.name}` : "") +
     (t.depends_on.length ? ` — dépend de ${t.depends_on.map((d) => "#" + d.seq).join(",")}` : "") +
     (t.question_ids.length ? ` — questions : ${t.question_ids.join(",")}` : "") +
     ` — id ${t.id}`
   );
 };
+
+/** Résultat encore valable seulement en relecture ou terminé ; sinon il décrit une tentative renvoyée ou abandonnée. */
+const isCurrentAttempt = (t: tasks.Task) => t.status === "review" || t.status === "done";
+
+function resultLines(t: tasks.Task): string[] {
+  const current = isCurrentAttempt(t);
+  const lines: string[] = [];
+  if (t.result) lines.push("", current ? "## Résultat déclaré" : "## Résultat de la tentative précédente", t.result);
+  if (t.verification) lines.push("", current ? "## Vérification réalisée" : "## Vérification de la tentative précédente", t.verification);
+  return lines;
+}
+
+function dependencyLine(ref: tasks.TaskRef): string {
+  const dep = tasks.getTask(ref.id);
+  const head = `- #${ref.seq} « ${ref.title} » (${ref.status})`;
+  if (!dep.result) return head;
+  const proof = dep.verification ? ` (vérifié : ${dep.verification})` : "";
+  const attempt = isCurrentAttempt(dep) ? "" : "tentative précédente : ";
+  return `${head} : ${attempt}${dep.result}${proof}`;
+}
 
 /** Fiche complète d'une tâche : tout ce qu'il faut à un agent (ou sous-agent) pour travailler seul. */
 function renderTaskBrief(t: tasks.Task): CallToolResult {
@@ -74,16 +145,16 @@ function renderTaskBrief(t: tasks.Task): CallToolResult {
     `Statut : ${t.status}${t.ready ? " (prête à démarrer)" : ""} · Priorité : ${t.priority} · Difficulté : ${t.difficulty}`,
     `Assignée à : ${t.assignee?.name ?? "personne (l'agent maître choisit)"} · Relecture : ${t.review_effective ? "requise" : "non requise"}${t.reviewer ? ` (par ${t.reviewer.name})` : ""}`,
   ];
+  if (t.for_human) head.push("👤 Réservée à l'humain : ne la fais pas à sa place, sauf demande explicite de sa part.");
   if (t.blocked_by.length)
     head.push(`⛔ BLOQUÉE par : ${t.blocked_by.map((d) => `#${d.seq} « ${d.title} » (${d.status})`).join(", ")}`);
   head.push("", "## Description", t.description.trim() || "(aucune)");
   if (t.review_notes) head.push("", "## Notes de la relecture précédente (à prendre en compte)", t.review_notes);
+  head.push(...resultLines(t));
+  if (t.forced_note) head.push("", "## Fin hors des règles", t.forced_note);
   if (t.depends_on.length) {
     head.push("", "## Dépendances et leur résultat");
-    for (const d of t.depends_on) {
-      const dep = tasks.getTask(d.id);
-      head.push(`- #${d.seq} « ${d.title} » (${d.status})${dep.result ? ` : ${dep.result}` : ""}`);
-    }
+    head.push(...t.depends_on.map(dependencyLine));
   }
   if (t.assignee) {
     const a = tasks.getAgent(t.assignee.id);
@@ -101,6 +172,8 @@ function renderTaskBrief(t: tasks.Task): CallToolResult {
       "## Skills du projet (instructions à respecter ; lis-les avec get_skill)",
       ...sk.map((x) => `- ${x.always ? "[toujours] " : ""}${x.name}${x.description ? ` — ${x.description}` : ""}`),
     );
+  const linked = decisions.decisionsForTask(t.id);
+  if (linked.length) head.push("", "## Décisions liées (à respecter)", ...linked.map(decisionLine));
   content.push({ type: "text", text: head.filter((l) => l !== undefined).join("\n") });
   if (t.question_ids.length) {
     content.push({ type: "text", text: "## Questions du grill liées à cette tâche (réponses de l'utilisateur)" });
@@ -109,6 +182,9 @@ function renderTaskBrief(t: tasks.Task): CallToolResult {
   return { content };
 }
 
+const recentDecisionLines = (recent: decisions.Decision[]): string[] =>
+  recent.length ? ["", `## Décisions récentes (${recent.length})`, ...recent.map(decisionLine)] : [];
+
 /** Construit une instance MCP (une par requête, mode stateless). */
 export function createMcpServer(): McpServer {
   const server = new McpServer(
@@ -116,11 +192,13 @@ export function createMcpServer(): McpServer {
     {
       instructions:
         "Brigade est le gestionnaire de projet local d'Alexandre. Si l'utilisateur dit « on continue » ou reprend un projet : commence par get_project_state. Flux du grill : (1) list_projects / create_project, " +
-        "(2) ask_questions pour déposer TOUTES les questions d'un coup puis continuer sans attendre — ne bloque jamais, " +
-        "(3) dis à l'utilisateur d'ouvrir l'URL renvoyée, (4) quand il annonce avoir répondu, appelle get_answers. " +
+        "(2) ask_questions pour déposer TOUTES les questions d'un coup, autant que nécessaire pour extraire le maximum de détails, " +
+        "puis continuer sans attendre — ne bloque jamais ; default_answer seulement avec une hypothèse solide, critical quand une erreur coûterait cher, " +
+        "(3) dis à l'utilisateur d'ouvrir l'URL renvoyée, (4) quand il annonce avoir répondu, appelle get_answers et suis la consigne de chaque sortie. " +
+        "« Décide pour moi » : tranche, puis record_decision (raison obligatoire, question_id) ; toute décision durable s'y enregistre aussi. " +
         "Kanban : découpe le travail avec create_tasks (dépendances, liens vers les questions), puis pour chaque tâche " +
         "prête (list_tasks ready_only) : start_task, get_task, travail (toi ou un sous-agent à qui tu transmets la fiche), " +
-        "complete_task, puis review_task si la relecture est exigée. Brigade ne lance aucun agent : c'est toi qui le fais. " +
+        "complete_task (result et verification obligatoires : la commande ou le contrôle réalisé), puis review_task si la relecture est exigée. Brigade ne lance aucun agent : c'est toi qui le fais. " +
         "Skills du projet (conventions, stack, règles) : list_skills puis get_skill ; lis d'emblée ceux marqués « toujours » " +
         "(get_project_state les signale) et les autres quand ils concernent la tâche.",
     },
@@ -204,6 +282,8 @@ export function createMcpServer(): McpServer {
               text: z.string().describe("La question (markdown)"),
               hint: z.string().optional().describe("Précision sur le type de réponse attendue"),
               choices: z.array(z.string()).optional().describe("Réponses suggérées (l'utilisateur peut aussi écrire librement)"),
+              critical: z.boolean().optional().describe("Question critique : « décide pour moi » y sera refusé"),
+              default_answer: z.string().optional().describe("Réponse que tu retiendrais sans avis de l'utilisateur ; seulement si tu as une hypothèse solide"),
             }),
           )
           .min(1),
@@ -251,7 +331,9 @@ export function createMcpServer(): McpServer {
       title: "Lire un grill et ses réponses",
       description:
         "Renvoie toutes les questions d'un grill avec les réponses de l'utilisateur, y compris les images jointes " +
-        "(en blocs image). À appeler quand l'utilisateur dit avoir répondu. Signale les questions restées sans réponse.",
+        "(en blocs image). À appeler quand l'utilisateur dit avoir répondu. Signale les questions restées sans réponse " +
+        "et celles modifiées depuis ta dernière lecture ; cet appel enregistre la lecture. Chaque sortie explicite " +
+        "(proposition validée, décide pour moi, pas pertinent, plus tard) arrive avec sa consigne, à suivre ; « plus tard » est listé à part.",
       inputSchema: { grill_id: z.string().describe("Id du grill (g_xxxxxxxx)") },
     },
     safe(({ grill_id }) => {
@@ -262,12 +344,25 @@ export function createMcpServer(): McpServer {
           text:
             `# Grill « ${g.title} » (${g.id}) — projet ${g.project.name}\n` +
             `Statut : ${g.status === "submitted" ? "marqué terminé par l'utilisateur" : "ouvert"} — ${g.answered}/${g.total} répondues.` +
+            (g.last_read_at ? `\nDernière lecture : ${g.last_read_at}.` : "") +
             (g.context ? `\n\nContexte posé :\n${g.context}` : ""),
         },
       ];
-      for (const q of g.questions) renderQuestion(q, content);
+      // « Plus tard » compte comme traité dans la progression, mais ne doit pas se lire comme une réponse.
+      const later = g.questions.filter((q) => q.outcome === "later");
+      for (const q of g.questions) if (q.outcome !== "later") renderQuestion(q, content);
+      if (later.length) {
+        content.push({ type: "text", text: `## Plus tard : ${later.length} question(s) à laisser ouvertes, ne présume rien` });
+        for (const q of later) renderQuestion(q, content);
+      }
       const pending = g.questions.filter((q) => !q.answered).map((q) => q.position);
       if (pending.length) content.push({ type: "text", text: `⚠ Sans réponse : question(s) ${pending.join(", ")}.` });
+      const undecided = g.questions.filter((q) => q.awaiting_decision).map((q) => q.position);
+      if (undecided.length) content.push({ type: "text", text: `⚠ En attente d'une décision : question(s) ${undecided.join(", ")}.` });
+      const modified = g.questions.filter((q) => q.modified_since_read).map((q) => q.position);
+      if (modified.length) content.push({ type: "text", text: `⚠ Modifiées depuis ta dernière lecture : question(s) ${modified.join(", ")}.` });
+      // Après le rendu : la réponse ci-dessus doit encore porter le marquage qu'elle lève.
+      store.markGrillRead(g.id);
       return { content };
     }),
   );
@@ -325,8 +420,13 @@ export function createMcpServer(): McpServer {
       if (k.review.length) out.push("### En relecture", ...k.review.map((t) => line(t)));
       if (k.in_progress.length)
         out.push("### En cours", ...k.in_progress.map((t) => line(t, ` — depuis ${humanDuration(Math.round((Date.now() - new Date(t.started_at ?? Date.now()).getTime()) / 60000))}`)));
-      if (k.ready.length) out.push("### Prêtes à démarrer", ...k.ready.map((t) => line(t)));
+      const humanReady = k.ready.filter((t) => t.for_human);
+      const agentReady = k.ready.filter((t) => !t.for_human);
+      if (agentReady.length) out.push("### Prêtes à démarrer", ...agentReady.map((t) => line(t)));
+      if (humanReady.length) out.push("### Prêtes, réservées à l'humain", ...humanReady.map((t) => line(t)));
       if (k.blocked.length) out.push("### Bloquées", ...k.blocked.map((t) => line(t)));
+
+      out.push(...recentDecisionLines(st.decisions.recent));
 
       out.push("", "## Agents");
       if (st.agents.length === 0) out.push("Aucun agent défini.");
@@ -339,6 +439,47 @@ export function createMcpServer(): McpServer {
 
       out.push("", "## Prochaines actions suggérées");
       out.push(...(st.next_actions.length ? st.next_actions.map((a, i) => `${i + 1}. ${a}`) : ["Rien d'urgent : demande à l'utilisateur ce qu'il veut faire."]));
+      return text(out.join("\n"));
+    }),
+  );
+
+  // ================= Décisions =================
+
+  server.registerTool(
+    "record_decision",
+    {
+      title: "Enregistrer une décision",
+      description:
+        "Écrit une décision dans le registre du projet, avec sa raison. Obligatoire pour clore un « Décide pour moi » : " +
+        "donne alors question_id. Permis aussi pour toute autre décision, liée ou non à une question ou à des tâches, " +
+        "sauf sur une question critique à laquelle l'utilisateur n'a pas répondu (refusé). " +
+        "Une décision est immuable ; pour en changer, enregistre-en une nouvelle.",
+      inputSchema: {
+        project: z.string().describe("Slug ou id du projet"),
+        decision: z.string().describe("Ce qui est décidé"),
+        reason: z.string().describe("Pourquoi"),
+        question_id: z.string().optional().describe("Question source (q_xxxxxxxx) ; clôt son « Décide pour moi »"),
+        task_ids: z.array(z.string()).optional().describe("Tâches concernées (id ou « #n »)"),
+      },
+    },
+    safe(({ project, ...input }) => {
+      const d = decisions.recordDecision(project, input);
+      return text(`Décision enregistrée :\n${decisionLine(d)}`);
+    }),
+  );
+
+  server.registerTool(
+    "list_decisions",
+    {
+      title: "Lister les décisions",
+      description: "Registre des décisions du projet, les plus récentes d'abord, et les « Décide pour moi » encore sans décision.",
+      inputSchema: { project: z.string().describe("Slug ou id du projet") },
+    },
+    safe(({ project }) => {
+      const all = decisions.listDecisions(project);
+      const awaiting = decisions.listAwaitingDecisions(project);
+      const out = all.length ? all.map(decisionLine) : ["Aucune décision."];
+      if (awaiting.length) out.push("", `« Décide pour moi » sans décision : ${awaiting.map((q) => q.id).join(", ")}`);
       return text(out.join("\n"));
     }),
   );
@@ -372,6 +513,7 @@ export function createMcpServer(): McpServer {
               assignee: z.string().optional().describe("Nom ou id d'un agent du projet (optionnel)"),
               reviewer: z.string().optional().describe("Nom ou id de l'agent relecteur (optionnel)"),
               review: z.boolean().optional().describe("Force la relecture pour cette tâche (sinon : réglage du projet)"),
+              for_human: z.boolean().optional().describe("Tâche à faire par l'humain (validation, décision) : aucun agent ne doit la prendre"),
               depends_on: z.array(z.string()).optional(),
               question_ids: z.array(z.string()).optional().describe("Ids de questions du grill à lier"),
             }),
@@ -435,6 +577,7 @@ export function createMcpServer(): McpServer {
         assignee: z.string().nullable().optional().describe("Nom/id d'agent, ou null pour retirer"),
         reviewer: z.string().nullable().optional(),
         review: z.boolean().nullable().optional().describe("true/false = surcharge ; null = hérite du projet"),
+        for_human: z.boolean().optional().describe("true = tâche à faire par l'humain ; false = tâche d'agent"),
         add_depends_on: z.array(z.string()).optional(),
         remove_depends_on: z.array(z.string()).optional(),
         link_questions: z.array(z.string()).optional(),
@@ -468,13 +611,17 @@ export function createMcpServer(): McpServer {
     {
       title: "Terminer une tâche",
       description:
-        "Déclare le travail fait, avec un résultat (ce qui a été fait, fichiers touchés, comment c'est vérifié). Si la " +
-        "relecture est exigée, la tâche passe « en relecture » ; sinon « terminée ». Le résultat est transmis aux tâches " +
-        "qui en dépendent.",
-      inputSchema: { task_id: z.string(), result: z.string().describe("Compte rendu concis et vérifiable") },
+        "Déclare le travail fait : `result` (ce qui a été fait, fichiers touchés) et `verification` (commande ou contrôle " +
+        "réalisé), tous deux obligatoires et non vides. Si la relecture est exigée, la tâche passe « en relecture » ; sinon " +
+        "« terminée ». Résultat et vérification sont transmis aux tâches qui en dépendent.",
+      inputSchema: {
+        task_id: z.string(),
+        result: z.string().describe("Compte rendu concis : ce qui a été fait"),
+        verification: z.string().describe("Commande ou contrôle réalisé, et son résultat"),
+      },
     },
-    safe(({ task_id, result }) => {
-      const t = tasks.completeTask(task_id, result);
+    safe(({ task_id, result, verification }) => {
+      const t = tasks.completeTask(task_id, result, verification);
       return text(
         `${t.status === "review" ? "En attente de relecture" : "Terminée"} :\n${taskLine(t)}`,
       );

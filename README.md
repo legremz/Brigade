@@ -69,7 +69,7 @@ npm start                # http://127.0.0.1:3100 (UI), /mcp (MCP), /api
 Développement : `npm run dev` (serveur, port 3100) et `npm --prefix web run dev` (Vite, port 5173, proxy `/api`).
 
 Variables : `PORT` (3100), `HOST` (0.0.0.0), `DATA_DIR` (`./data`), `WEB_DIR` (`web/dist`),
-`BRIGADE_TOKEN` (jeton Bearer du MCP, optionnel), `BRIGADE_PUBLIC_URL` (base des liens renvoyés à l'IA).
+`BRIGADE_TOKEN` (jeton Bearer du MCP, optionnel), `BRIGADE_PUBLIC_URL` (base des liens renvoyés à l'IA, et seul hôte accepté en dehors de la boucle locale sur `/api` et `/mcp`), `BRIGADE_STALE_MINUTES` (minutes sans activité avant l'alerte sur une tâche en cours, 120 par défaut ; le serveur refuse de démarrer si la valeur n'est pas un entier valide).
 L'UI et l'API ne sont pas authentifiées : ne pas exposer le port hors de la boucle locale.
 
 ## Docker
@@ -99,15 +99,17 @@ mkdir -p ~/.claude/skills && ln -sfn "$PWD/skills/brigade" ~/.claude/skills/brig
 | `ping` | Vérifie que Brigade répond |
 | `get_project_state` | **Reprise** : réglages, grills, kanban, agents et prochaines actions suggérées, en une réponse |
 | `list_projects` / `create_project` | Gérer les projets |
-| `ask_questions` | Déposer un lot de questions (non bloquant) |
+| `ask_questions` | Déposer un lot de questions (non bloquant), avec criticité et réponse par défaut éventuelles |
 | `list_grills` | Avancement des grills d'un projet |
-| `get_answers` | Lire un grill, réponses et images incluses |
+| `get_answers` | Lire un grill : réponses, images, sorties et leur consigne, réponses modifiées depuis la dernière lecture |
 | `get_question` | Lire une seule question (pour un sous-agent) |
 | `create_tasks` | Créer un lot de tâches avec dépendances (`ref` locales) et liens vers des questions |
 | `list_tasks` | Kanban d'un projet ; chaque tâche est PRÊTE ou BLOQUÉE (`ready_only`) |
 | `get_task` | Fiche complète : description, résultats des dépendances, agent, questions liées avec images |
 | `update_task` | Champs, assignation, dépendances, liens |
-| `start_task` / `complete_task` / `review_task` / `release_task` | Cycle de vie : à faire → en cours → (relecture →) terminée |
+| `start_task` / `complete_task` / `review_task` / `release_task` | Cycle de vie : à faire → en cours → (relecture →) terminée. `complete_task` exige `result` et `verification` (preuve de fin : commande ou contrôle réalisé) |
+| `record_decision` | Écrire une décision immuable (raison obligatoire, question source et tâches optionnelles) ; clôt un « Décide pour moi » |
+| `list_decisions` | Registre des décisions et « Décide pour moi » encore sans décision |
 | `list_agents` / `save_agent` | Agents du projet et leur disponibilité |
 | `list_skills` / `get_skill` / `save_skill` | Skills (instructions durables) du projet ; import/export `SKILL.md` dans l'interface |
 | `set_project_settings` | Mode, modèle par défaut, relecture exigée |

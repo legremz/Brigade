@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { api, type Status, type Task } from "./api";
+import { api, ApiError, type Status, type Task } from "./api";
 import { Crumbs, ErrorBox } from "./common";
 import { useLoad } from "./hooks";
 import { ProjectTabs } from "./ProjectTabs";
@@ -13,6 +13,17 @@ const COLUMNS: { status: Status; label: string }[] = [
   { status: "done", label: "Terminées" },
 ];
 
+/** Si le serveur refuse le passage en « Terminées », propose de l'imposer ; un refus laisse le motif s'afficher. */
+async function moveTask(id: string, status: Status): Promise<void> {
+  try {
+    await api.taskAction(id, { action: "move", status });
+  } catch (err) {
+    if (!(err instanceof ApiError) || err.code !== "force_required") throw err;
+    if (!confirm(`${err.message}\n\nForcer quand même le passage en « Terminées » ?`)) throw err;
+    await api.taskAction(id, { action: "move", status, force: true });
+  }
+}
+
 export function Board({ slug, openId }: { slug: string; openId?: string }) {
   const project = useLoad(() => api.project(slug), [slug], 8000);
   const tasks = useLoad(() => api.tasks(slug), [slug], 4000);
@@ -21,6 +32,7 @@ export function Board({ slug, openId }: { slug: string; openId?: string }) {
   const [title, setTitle] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [over, setOver] = useState<Status | null>(null);
+  const [doneOpen, setDoneOpen] = useState(false);
 
   const list = tasks.data ?? [];
   const open = openId ? list.find((t) => t.id === openId) : undefined;
@@ -49,7 +61,8 @@ export function Board({ slug, openId }: { slug: string; openId?: string }) {
     if (!t || t.status === status) return;
     if (status !== "todo" && status !== "done" && t.blocked_by.length && !confirm("Cette tâche est bloquée par une dépendance. La déplacer quand même ?")) return;
     try {
-      await api.taskAction(id, { action: "move", status });
+      await moveTask(id, status);
+      setError(null);
       refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -71,10 +84,11 @@ export function Board({ slug, openId }: { slug: string; openId?: string }) {
       <div className="board">
         {COLUMNS.map(({ status, label }) => {
           const items = list.filter((t) => t.status === status);
+          const collapsed = status === "done" && !doneOpen;
           return (
             <section
               key={status}
-              className={`bcol${over === status ? " over" : ""}`}
+              className={`bcol${over === status ? " over" : ""}${collapsed ? " collapsed" : ""}`}
               onDragOver={(e) => {
                 e.preventDefault();
                 setOver(status);
@@ -82,8 +96,14 @@ export function Board({ slug, openId }: { slug: string; openId?: string }) {
               onDragLeave={() => setOver((o) => (o === status ? null : o))}
               onDrop={(e) => void drop(status, e.dataTransfer.getData("text/plain"))}
             >
-              <h2 className="col-title">{label} <span className="count">{items.length}</span></h2>
-              {items.map((t) => <TaskCard key={t.id} task={t} slug={slug} />)}
+              {status === "done" ? (
+                <button type="button" className="col-title col-toggle" aria-expanded={doneOpen} onClick={() => setDoneOpen((v) => !v)}>
+                  {doneOpen ? "▾" : "▸"} {label} <span className="count">{items.length}</span>
+                </button>
+              ) : (
+                <h2 className="col-title">{label} <span className="count">{items.length}</span></h2>
+              )}
+              {!collapsed && items.map((t) => <TaskCard key={t.id} task={t} slug={slug} />)}
             </section>
           );
         })}
@@ -120,6 +140,7 @@ function TaskCard({ task, slug }: { task: Task; slug: string }) {
       <strong>{task.title}</strong>
       <div className="task-meta">
         <span title="Difficulté">⚙ {DIFFICULTY_LABEL[task.difficulty]}</span>
+        {task.for_human && <span className="human-tag">👤 pour toi</span>}
         {task.assignee && <span className="agent-tag">🤖 {task.assignee.name}</span>}
         {task.question_ids.length > 0 && <span title="Questions du grill liées">❓ {task.question_ids.length}</span>}
         {task.depends_on.length > 0 && (
@@ -127,7 +148,8 @@ function TaskCard({ task, slug }: { task: Task; slug: string }) {
         )}
       </div>
       {blocked && <div className="lock">🔒 bloquée par {task.blocked_by.map((d) => `#${d.seq}`).join(", ")}</div>}
-      {task.status === "todo" && task.ready && task.depends_on.length > 0 && <div className="ready">✔ prête</div>}
+      {task.ready && <div className="ready">✔ prête</div>}
+      {task.stale && <div className="stale">⏰ sans activité depuis {task.stale_for}</div>}
     </a>
   );
 }

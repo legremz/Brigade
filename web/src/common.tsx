@@ -17,3 +17,14 @@ export function Crumbs({ items }: { items: { label: string; to?: string }[] }) {
 export function ErrorBox({ message }: { message: string }) {
   return <p className="error box">{message}</p>;
 }
+
+export function Progress({ answered, total }: { answered: number; total: number }) {
+  return (
+    <span className="progress" title={`${answered} répondue(s) sur ${total}`}>
+      <span className="bar">
+        <span style={{ width: total ? `${(answered / total) * 100}%` : 0 }} />
+      </span>
+      {answered}/{total}
+    </span>
+  );
+}

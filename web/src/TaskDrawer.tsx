@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useLayoutEffect, useState } from "react";
 import { api, type Agent, type Difficulty, type Priority, type ProjectQuestion, type Task } from "./api";
 import { EditableMarkdown } from "./EditableMarkdown";
 import { Markdown } from "./Markdown";
@@ -7,6 +7,8 @@ import { href } from "./router";
 export const PRIORITY_LABEL: Record<Priority, string> = { low: "Basse", medium: "Moyenne", high: "Haute", urgent: "Urgente" };
 export const DIFFICULTY_LABEL: Record<Difficulty, string> = { easy: "Facile", medium: "Moyenne", hard: "Difficile" };
 const STATUS_LABEL = { todo: "À faire", in_progress: "En cours", review: "En relecture", done: "Terminée" } as const;
+
+const LOSE_DRAFT_MESSAGE = "Un brouillon n'est pas enregistré. Fermer et le perdre ?";
 
 export function TaskDrawer({
   slug,
@@ -27,21 +29,40 @@ export function TaskDrawer({
 }) {
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState("");
+  const [verification, setVerification] = useState("");
   const [notes, setNotes] = useState("");
+  const [titleDirty, setTitleDirty] = useState(false);
+  const [descriptionDirty, setDescriptionDirty] = useState(false);
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+  const hasDraft = titleDirty || descriptionDirty || [result, verification, notes].some((draft) => draft.trim() !== "");
+  const requestClose = useCallback(() => {
+    if (!hasDraft || confirm(LOSE_DRAFT_MESSAGE)) onClose();
+  }, [hasDraft, onClose]);
+
+  // En capture : couvre aussi les liens rendus depuis le markdown, qui quittent le tiroir sans passer par requestClose.
+  function guardLinks(e: React.MouseEvent) {
+    const onLink = e.target instanceof Element && e.target.closest("a[href]") !== null;
+    if (onLink && hasDraft && !confirm(LOSE_DRAFT_MESSAGE)) e.preventDefault();
+  }
+
+  useLayoutEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") requestClose();
+    };
     addEventListener("keydown", onKey);
     return () => removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [requestClose]);
 
-  async function run<T>(fn: () => Promise<T>) {
+  /** Renvoie false en cas d'échec, pour que l'appelant conserve la saisie. */
+  async function run<T>(fn: () => Promise<T>): Promise<boolean> {
     try {
       setError(null);
       await fn();
       onChange();
+      return true;
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+      return false;
     }
   }
   const patch = (p: Parameters<typeof api.updateTask>[1]) => run(() => api.updateTask(task.id, p));
@@ -52,24 +73,34 @@ export function TaskDrawer({
   const questionCandidates = questions.filter((q) => !task.question_ids.includes(q.id));
 
   return (
-    <div className="drawer-backdrop" onClick={onClose}>
-      <aside className="drawer" onClick={(e) => e.stopPropagation()}>
+    <div className="drawer-backdrop" onClick={requestClose}>
+      <aside className="drawer" onClick={(e) => e.stopPropagation()} onClickCapture={guardLinks}>
         <header className="drawer-head">
           <span className="muted">#{task.seq} · {STATUS_LABEL[task.status]}</span>
-          <button type="button" className="ghost" onClick={onClose}>Fermer ✕</button>
+          <button type="button" className="ghost" onClick={requestClose}>Fermer ✕</button>
         </header>
 
         <input
           className="title-input"
           defaultValue={task.title}
           key={task.title}
-          onBlur={(e) => e.target.value !== task.title && void patch({ title: e.target.value })}
+          onChange={(e) => setTitleDirty(e.target.value !== task.title)}
+          onBlur={(e) => {
+            setTitleDirty(false);
+            if (e.target.value !== task.title) void patch({ title: e.target.value });
+          }}
         />
 
         {task.blocked_by.length > 0 && task.status === "todo" && (
           <p className="error box">
             🔒 Bloquée par {task.blocked_by.map((d) => `#${d.seq} « ${d.title} » (${STATUS_LABEL[d.status]})`).join(", ")}.
           </p>
+        )}
+        {task.stale && (
+          <div className="stale-alert">
+            <span>⏰ Sans activité depuis {task.stale_for} : l'agent a peut-être planté.</span>
+            <button type="button" onClick={() => void action({ action: "release" })}>Remettre à faire</button>
+          </div>
         )}
         {error && <p className="error box">{error}</p>}
 
@@ -94,7 +125,7 @@ export function TaskDrawer({
           </label>
           <label>Relecture
             <select
-              value={task.review_required === null ? "inherit" : task.review_required ? "yes" : "no"}
+              value={reviewChoice(task.review_required)}
               onChange={(e) => void patch({ review: e.target.value === "inherit" ? null : e.target.value === "yes" })}
             >
               <option value="inherit">Selon le projet ({task.review_effective ? "oui" : "non"})</option>
@@ -102,10 +133,14 @@ export function TaskDrawer({
               <option value="no">Jamais</option>
             </select>
           </label>
+          <label className="check">
+            <input type="checkbox" checked={task.for_human} onChange={(e) => void patch({ for_human: e.target.checked })} />
+            Pour l'humain : aucun agent ne doit la prendre
+          </label>
         </div>
 
         <h3>Description</h3>
-        <EditableMarkdown value={task.description} placeholder="Aucune description." onSave={(v) => patch({ description: v })} />
+        <EditableMarkdown value={task.description} placeholder="Aucune description." onSave={(v) => patch({ description: v })} onDirtyChange={setDescriptionDirty} />
 
         <h3>Dépend de</h3>
         <div className="chips">
@@ -147,52 +182,106 @@ export function TaskDrawer({
             <section className="card context"><Markdown>{task.review_notes}</Markdown></section>
           </>
         )}
+        {task.forced_note && <p className="error box">⚠ {task.forced_note}</p>}
         {task.result && (
           <>
             <h3>Résultat</h3>
             <section className="card"><Markdown>{task.result}</Markdown></section>
+            {task.verification && (
+              <>
+                <h3>Vérification</h3>
+                <section className="card"><Markdown>{task.verification}</Markdown></section>
+              </>
+            )}
           </>
         )}
 
         <h3>Actions</h3>
-        <div className="actions">
-          {task.status === "todo" && (
-            <button type="button" className="primary" disabled={!task.ready} title={task.ready ? "" : "Dépendances non terminées"} onClick={() => void action({ action: "start", agent: task.assignee?.id })}>
-              ▶ Démarrer
-            </button>
-          )}
-          {task.status === "in_progress" && (
-            <>
-              <textarea value={result} onChange={(e) => setResult(e.target.value)} placeholder="Résultat (ce qui a été fait, comment c'est vérifié)…" rows={3} />
-              <button type="button" className="primary" onClick={() => void action({ action: "complete", result }).then(() => setResult(""))}>
-                ✔ Terminer{task.review_effective ? " (→ relecture)" : ""}
-              </button>
-            </>
-          )}
-          {task.status === "review" && (
-            <>
-              <textarea value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Notes de relecture (obligatoires pour demander des changements)…" rows={3} />
-              <button type="button" className="primary" onClick={() => void action({ action: "approve", notes })}>👍 Approuver</button>
-              <button type="button" onClick={() => void action({ action: "changes", notes })}>↩ Demander des changements</button>
-            </>
-          )}
-          {(task.status === "in_progress" || task.status === "review") && (
-            <button type="button" className="ghost" onClick={() => void action({ action: "release" })}>Remettre à faire</button>
-          )}
-          {task.status === "done" && (
-            <button type="button" className="ghost" onClick={() => void action({ action: "move", status: "todo" })}>Rouvrir</button>
-          )}
-          <button
-            type="button"
-            className="danger"
-            onClick={() => {
-              if (confirm(`Supprimer la tâche #${task.seq} ?`)) void run(() => api.deleteTask(task.id)).then(onClose);
-            }}
-          >
-            Supprimer
-          </button>
-        </div>
+        <TaskActions
+          task={task}
+          result={result}
+          onResult={setResult}
+          verification={verification}
+          onVerification={setVerification}
+          notes={notes}
+          onNotes={setNotes}
+          action={action}
+          onDelete={() => {
+            if (confirm(`Supprimer la tâche #${task.seq} ?`)) void run(() => api.deleteTask(task.id)).then((deleted) => {
+              if (deleted) onClose();
+            });
+          }}
+        />
       </aside>
+    </div>
+  );
+}
+
+const reviewChoice = (required: boolean | null): "inherit" | "yes" | "no" => {
+  if (required === null) return "inherit";
+  return required ? "yes" : "no";
+};
+
+function TaskActions({
+  task,
+  result,
+  onResult,
+  verification,
+  onVerification,
+  notes,
+  onNotes,
+  action,
+  onDelete,
+}: {
+  task: Task;
+  result: string;
+  onResult: (v: string) => void;
+  verification: string;
+  onVerification: (v: string) => void;
+  notes: string;
+  onNotes: (v: string) => void;
+  action: (body: Record<string, unknown>) => Promise<boolean>;
+  onDelete: () => void;
+}) {
+  async function complete() {
+    if (!(await action({ action: "complete", result, verification }))) return;
+    onResult("");
+    onVerification("");
+  }
+  async function review(verdict: "approve" | "changes") {
+    if (await action({ action: verdict, notes })) onNotes("");
+  }
+
+  return (
+    <div className="actions">
+      {task.status === "todo" && (
+        <button type="button" className="primary" disabled={!task.ready} title={task.ready ? "" : "Dépendances non terminées"} onClick={() => void action({ action: "start", agent: task.assignee?.id })}>
+          ▶ Démarrer
+        </button>
+      )}
+      {task.status === "in_progress" && (
+        <>
+          <textarea value={result} onChange={(e) => onResult(e.target.value)} placeholder="Résultat : ce qui a été fait…" rows={3} />
+          <textarea value={verification} onChange={(e) => onVerification(e.target.value)} placeholder="Vérification : commande ou contrôle réalisé…" rows={2} />
+          <button type="button" className="primary" onClick={() => void complete()}>
+            ✔ Terminer{task.review_effective ? " (→ relecture)" : ""}
+          </button>
+        </>
+      )}
+      {task.status === "review" && (
+        <>
+          <textarea value={notes} onChange={(e) => onNotes(e.target.value)} placeholder="Notes de relecture (obligatoires pour demander des changements)…" rows={3} />
+          <button type="button" className="primary" onClick={() => void review("approve")}>👍 Approuver</button>
+          <button type="button" onClick={() => void review("changes")}>↩ Demander des changements</button>
+        </>
+      )}
+      {((task.status === "in_progress" && !task.stale) || task.status === "review") && (
+        <button type="button" className="ghost" onClick={() => void action({ action: "release" })}>Remettre à faire</button>
+      )}
+      {task.status === "done" && (
+        <button type="button" className="ghost" onClick={() => void action({ action: "move", status: "todo" })}>Rouvrir</button>
+      )}
+      <button type="button" className="danger" onClick={onDelete}>Supprimer</button>
     </div>
   );
 }

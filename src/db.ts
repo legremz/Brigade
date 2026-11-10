@@ -114,6 +114,49 @@ const MIGRATIONS: string[] = [
     UNIQUE (project_id, name)
   );
   `,
+  // 4 : trace d'un passage forcé en « terminée » malgré dépendances ou relecture
+  `
+  ALTER TABLE tasks ADD COLUMN forced_note TEXT NOT NULL DEFAULT '';
+  `,
+  // 5 : commande ou contrôle prouvant qu'une tâche est finie
+  `
+  ALTER TABLE tasks ADD COLUMN verification TEXT NOT NULL DEFAULT '';
+  `,
+  // 6 : suivi de la lecture d'un grill par get_answers (les grills déjà lus avant cette version repartent de zéro)
+  `
+  ALTER TABLE grills ADD COLUMN last_read_at TEXT;
+  ALTER TABLE questions ADD COLUMN modified_since_read INTEGER NOT NULL DEFAULT 0;
+  `,
+  // 7 : criticité, réponse par défaut et sortie explicite. « skipped » reste tel quel : son intention d'origine est inconnue.
+  `
+  ALTER TABLE questions ADD COLUMN critical INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE questions ADD COLUMN default_answer TEXT NOT NULL DEFAULT '';
+  ALTER TABLE questions ADD COLUMN outcome TEXT CHECK (outcome IN ('accept_default','decide_for_me','not_relevant','later'));
+  `,
+  // 8 : registre des décisions. Une décision survit à sa question et à ses tâches ; seule la suppression du projet l'emporte.
+  `
+  CREATE TABLE decisions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    decision TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    question_id TEXT REFERENCES questions(id) ON DELETE SET NULL,
+    question_text TEXT,  -- copie à l'enregistrement : garde le sens si le grill source disparaît ; NULL = jamais de source
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE decision_tasks (
+    decision_id TEXT NOT NULL REFERENCES decisions(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    PRIMARY KEY (decision_id, task_id)
+  );
+  CREATE INDEX idx_decisions_project ON decisions(project_id, created_at);
+  CREATE INDEX idx_decisions_question ON decisions(question_id);
+  CREATE INDEX idx_decision_tasks_task ON decision_tasks(task_id);
+  `,
+  // 9 : tâche réservée à l'humain. Toujours explicite : aucune tâche existante n'est marquée, surtout pas d'après son titre.
+  `
+  ALTER TABLE tasks ADD COLUMN for_human INTEGER NOT NULL DEFAULT 0 CHECK (for_human IN (0,1));
+  `,
 ];
 
 const current = (db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version;

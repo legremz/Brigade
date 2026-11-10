@@ -6,8 +6,8 @@ import { ATTACHMENTS_DIR, db } from "./db.js";
 export class NotFoundError extends Error {}
 export class InvalidError extends Error {}
 
-const now = () => new Date().toISOString();
-const newId = (prefix: string) => `${prefix}_${randomBytes(4).toString("hex")}`;
+export const now = (): string => new Date().toISOString();
+export const newId = (prefix: string): string => `${prefix}_${randomBytes(4).toString("hex")}`;
 
 // ---------- Types ----------
 
@@ -35,6 +35,10 @@ export interface Attachment {
   size: number;
   created_at: string;
 }
+export const OUTCOMES = ["accept_default", "decide_for_me", "not_relevant", "later"] as const;
+/** Sortie explicite d'une question : valider la proposition, décide pour moi, pas pertinent, plus tard. */
+export type Outcome = (typeof OUTCOMES)[number];
+
 export interface Question {
   id: string;
   grill_id: string;
@@ -42,10 +46,22 @@ export interface Question {
   text: string;
   hint: string;
   choices: string[] | null;
+  /** Question sur laquelle « décide pour moi » est refusé. */
+  critical: boolean;
+  /** Proposition de l'agent, "" s'il n'en a pas. */
+  default_answer: string;
   answer_text: string;
+  /** Ancienne sortie « Passer », conservée pour les grills existants ; `outcome` la remplace. */
   skipped: boolean;
+  outcome: Outcome | null;
+  /** Sorties que le serveur acceptera sur cette question. */
+  available_outcomes: Outcome[];
   answered: boolean;
   answered_at: string | null;
+  /** La réponse a changé depuis la dernière lecture du grill par get_answers. */
+  modified_since_read: boolean;
+  /** « Décide pour moi » sans décision enregistrée pour cette question. */
+  awaiting_decision: boolean;
   attachments: Attachment[];
 }
 export interface GrillSummary {
@@ -56,6 +72,8 @@ export interface GrillSummary {
   status: "open" | "submitted";
   created_at: string;
   submitted_at: string | null;
+  /** Dernière lecture par get_answers, null tant que le grill n'a pas été lu. */
+  last_read_at: string | null;
   total: number;
   answered: number;
 }
@@ -168,6 +186,8 @@ export interface NewQuestion {
   text: string;
   hint?: string;
   choices?: string[];
+  critical?: boolean;
+  default_answer?: string;
 }
 
 export function createGrill(projectRef: string, title: string, context: string, questions: NewQuestion[]): Grill {
@@ -185,11 +205,20 @@ export function createGrill(projectRef: string, title: string, context: string, 
       now(),
     );
     const ins = db.prepare(
-      "INSERT INTO questions (id, grill_id, position, text, hint, choices) VALUES (?,?,?,?,?,?)",
+      "INSERT INTO questions (id, grill_id, position, text, hint, choices, critical, default_answer) VALUES (?,?,?,?,?,?,?,?)",
     );
     questions.forEach((q, i) => {
       if (!q.text.trim()) throw new InvalidError(`La question ${i + 1} est vide.`);
-      ins.run(newId("q"), id, i + 1, q.text, q.hint ?? "", q.choices?.length ? JSON.stringify(q.choices) : null);
+      ins.run(
+        newId("q"),
+        id,
+        i + 1,
+        q.text,
+        q.hint ?? "",
+        q.choices?.length ? JSON.stringify(q.choices) : null,
+        q.critical ? 1 : 0,
+        q.default_answer?.trim() ?? "",
+      );
     });
     db.exec("COMMIT");
   } catch (e) {
@@ -212,7 +241,16 @@ export function listGrills(projectRef: string, status?: "open" | "submitted"): G
   return db.prepare(sql).all(...args) as unknown as GrillSummary[];
 }
 
+function availableOutcomes(critical: boolean, defaultAnswer: string): Outcome[] {
+  return OUTCOMES.filter((o) => {
+    if (o === "accept_default") return defaultAnswer !== "";
+    return o !== "decide_for_me" || !critical;
+  });
+}
+
 function toQuestion(row: Row, attachments: Attachment[]): Question {
+  const critical = Boolean(row.critical);
+  const defaultAnswer = String(row.default_answer);
   return {
     id: String(row.id),
     grill_id: String(row.grill_id),
@@ -220,13 +258,23 @@ function toQuestion(row: Row, attachments: Attachment[]): Question {
     text: String(row.text),
     hint: String(row.hint),
     choices: row.choices ? (JSON.parse(String(row.choices)) as string[]) : null,
+    critical,
+    default_answer: defaultAnswer,
     answer_text: String(row.answer_text),
     skipped: Boolean(row.skipped),
+    outcome: row.outcome == null ? null : (String(row.outcome) as Outcome), // borné par le CHECK de la colonne
+    available_outcomes: availableOutcomes(critical, defaultAnswer),
     answered: row.answered_at != null,
     answered_at: row.answered_at ? String(row.answered_at) : null,
+    modified_since_read: Boolean(row.modified_since_read),
+    awaiting_decision: Boolean(row.awaiting_decision),
     attachments,
   };
 }
+
+const questionSql = `
+  SELECT q.*, (q.outcome = 'decide_for_me' AND NOT EXISTS (SELECT 1 FROM decisions d WHERE d.question_id = q.id)) AS awaiting_decision
+  FROM questions q`;
 
 function attachmentsByQuestion(grillId: string): Map<string, Attachment[]> {
   const rows = db
@@ -245,7 +293,7 @@ export function getGrill(id: string): Grill {
   if (!row) throw new NotFoundError(`Grill introuvable : « ${id} ». Utilise list_grills.`);
   const project = db.prepare("SELECT id, slug, name FROM projects WHERE id = ?").get(row.project_id) as Grill["project"];
   const atts = attachmentsByQuestion(id);
-  const questions = (db.prepare("SELECT * FROM questions WHERE grill_id = ? ORDER BY position").all(id) as Row[]).map(
+  const questions = (db.prepare(`${questionSql} WHERE q.grill_id = ? ORDER BY q.position`).all(id) as Row[]).map(
     (q) => toQuestion(q, atts.get(String(q.id)) ?? []),
   );
   return { ...row, project, questions };
@@ -261,6 +309,19 @@ export function setGrillStatus(id: string, status: "open" | "submitted"): Grill 
   return getGrill(id);
 }
 
+/** Enregistre la lecture des réponses par get_answers : les réponses lues ne sont plus « modifiées ». */
+export function markGrillRead(id: string): void {
+  db.exec("BEGIN");
+  try {
+    db.prepare("UPDATE grills SET last_read_at = ? WHERE id = ?").run(now(), id);
+    db.prepare("UPDATE questions SET modified_since_read = 0 WHERE grill_id = ?").run(id);
+    db.exec("COMMIT");
+  } catch (e) {
+    db.exec("ROLLBACK");
+    throw e;
+  }
+}
+
 export function deleteGrill(id: string): void {
   const g = getGrill(id);
   const ids = g.questions.flatMap((q) => q.attachments.map((a) => a.id));
@@ -271,7 +332,7 @@ export function deleteGrill(id: string): void {
 // ---------- Questions et réponses ----------
 
 export function getQuestion(id: string): Question & { grill: Pick<GrillSummary, "id" | "title" | "status"> } {
-  const row = db.prepare("SELECT * FROM questions WHERE id = ?").get(id) as Row | undefined;
+  const row = db.prepare(`${questionSql} WHERE q.id = ?`).get(id) as Row | undefined;
   if (!row) throw new NotFoundError(`Question introuvable : « ${id} ».`);
   const attachments = db
     .prepare("SELECT * FROM attachments WHERE question_id = ? ORDER BY created_at")
@@ -283,18 +344,55 @@ export function getQuestion(id: string): Question & { grill: Pick<GrillSummary, 
   return { ...toQuestion(row, attachments), grill };
 }
 
-/** Une question est « répondue » si elle a du texte, une image, ou si elle est explicitement passée. */
-export function setAnswer(questionId: string, fields: { text?: string; skipped?: boolean }): Question {
+/** Sans lecture préalable, rien n'est « modifié depuis la lecture ». */
+function markModifiedSinceRead(questionId: string): void {
+  db.prepare(
+    `UPDATE questions SET modified_since_read = 1
+     WHERE id = ? AND grill_id IN (SELECT id FROM grills WHERE last_read_at IS NOT NULL)`,
+  ).run(questionId);
+}
+
+export interface AnswerFields {
+  text?: string;
+  skipped?: boolean;
+  /** null retire la sortie ; absent la laisse telle quelle. */
+  outcome?: Outcome | null;
+}
+
+function assertOutcomeAllowed(q: Question, outcome: Outcome): void {
+  if (outcome === "decide_for_me" && q.critical)
+    throw new InvalidError("« Décide pour moi » est refusé sur une question critique : réponds-y toi-même.");
+  if (outcome === "accept_default" && q.default_answer === "")
+    throw new InvalidError("« Valider la proposition » est refusé : cette question n'a pas de réponse par défaut.");
+}
+
+/** Passer et sortie explicite s'excluent : le dernier choix de l'utilisateur remplace l'autre, le texte reste. */
+function nextExit(q: Question, fields: AnswerFields): { skipped: boolean; outcome: Outcome | null } {
+  if (fields.skipped && fields.outcome) throw new InvalidError("Une question ne peut pas être à la fois passée et avoir une sortie.");
+  if (fields.outcome) {
+    assertOutcomeAllowed(q, fields.outcome);
+    return { skipped: false, outcome: fields.outcome };
+  }
+  if (fields.skipped) return { skipped: true, outcome: null };
+  // Écrire une réponse sur une question reportée, c'est y répondre ; pour les autres sorties, le texte reste une note.
+  if (q.outcome === "later" && fields.text?.trim()) return { skipped: q.skipped, outcome: null };
+  return { skipped: fields.skipped ?? q.skipped, outcome: fields.outcome === undefined ? q.outcome : fields.outcome };
+}
+
+/** Une question est « répondue » si elle a du texte, une image, une sortie, ou si elle est explicitement passée. */
+export function setAnswer(questionId: string, fields: AnswerFields): Question {
   const q = getQuestion(questionId);
   const text = fields.text ?? q.answer_text;
-  const skipped = fields.skipped ?? q.skipped;
-  const answered = text.trim() !== "" || q.attachments.length > 0 || skipped;
-  db.prepare("UPDATE questions SET answer_text = ?, skipped = ?, answered_at = ? WHERE id = ?").run(
+  const { skipped, outcome } = nextExit(q, fields);
+  const answered = text.trim() !== "" || q.attachments.length > 0 || skipped || outcome !== null;
+  db.prepare("UPDATE questions SET answer_text = ?, skipped = ?, outcome = ?, answered_at = ? WHERE id = ?").run(
     text,
     skipped ? 1 : 0,
+    outcome,
     answered ? (q.answered_at ?? now()) : null,
     questionId,
   );
+  if (text !== q.answer_text || skipped !== q.skipped || outcome !== q.outcome) markModifiedSinceRead(questionId);
   return getQuestion(questionId);
 }
 
@@ -325,6 +423,7 @@ export function addAttachment(questionId: string, mime: string, filename: string
     att.size,
     att.created_at,
   );
+  markModifiedSinceRead(questionId);
   setAnswer(questionId, {}); // recalcule « répondue »
   return att;
 }
@@ -340,6 +439,7 @@ export function deleteAttachment(id: string): void {
   if (!meta) throw new NotFoundError(`Pièce jointe introuvable : « ${id} ».`);
   db.prepare("DELETE FROM attachments WHERE id = ?").run(id);
   rmSync(join(ATTACHMENTS_DIR, id), { force: true });
+  markModifiedSinceRead(meta.question_id);
   setAnswer(meta.question_id, {}); // recalcule « répondue »
 }
 

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useLayoutEffect, useState } from "react";
 import { Markdown } from "./Markdown";
 
 /** Texte markdown affiché en lecture ; « Modifier » ouvre un éditeur. */
@@ -7,14 +7,21 @@ export function EditableMarkdown({
   placeholder,
   onSave,
   readOnly,
+  onDirtyChange,
 }: {
   value: string;
   placeholder: string;
-  onSave: (v: string) => void | Promise<void>;
+  /** Renvoyer false garde l'éditeur ouvert (échec d'enregistrement). */
+  onSave: (v: string) => boolean | void | Promise<boolean | void>;
   readOnly?: boolean;
+  /** Signale qu'un brouillon non enregistré existe, pour protéger la fermeture du conteneur. */
+  onDirtyChange?: (dirty: boolean) => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(value);
+  const dirty = editing && draft !== value;
+  // Effet de mise en page : le conteneur doit connaître le brouillon avant la touche suivante.
+  useLayoutEffect(() => onDirtyChange?.(dirty), [dirty, onDirtyChange]);
 
   if (editing) {
     return (
@@ -25,8 +32,7 @@ export function EditableMarkdown({
             type="button"
             className="primary"
             onClick={async () => {
-              await onSave(draft);
-              setEditing(false);
+              if ((await onSave(draft)) !== false) setEditing(false);
             }}
           >
             Enregistrer
